@@ -1,0 +1,36 @@
+/vis/open OGLSQt
+
+# Force scene build + attach + first paint
+/vis/viewer/set/autoRefresh false
+/vis/drawVolume
+/vis/scene/notifyHandlers
+/vis/viewer/flush
+/vis/viewer/refresh
+/vis/viewer/set/autoRefresh true
+
+#/gpd3d/bg/enable true
+/gpd3d/bg/writeFITS false
+/run/initialize
+
+/vis/open OGLSQt
+/vis/viewer/set/autoRefresh false
+/vis/drawVolume
+/vis/scene/notifyHandlers
+/vis/viewer/flush
+/vis/viewer/refresh
+/vis/viewer/set/autoRefresh true
+/vis/scene/add/axes 0 0 0 0.1 m
+
+# --- TRAJECTORIES: THIS IS WHAT YOU WERE MISSING ---
+/tracking/storeTrajectory 1
+/vis/scene/add/trajectories smooth
+/gpd3d/bg/writeROOT true
+/gpd3d/bg/rootFile test.root
+
+#just examples
+/gpd3d/bg/enable true
+/gpd3d/gen/useSphere false
+#/gpd3d/gen/sphereRadius 130 mm
+#/gpd3d/gen/sphereCenter 0 0 0 mm
+/gpd3d/gen/beamZ 30 mm          # or 100 mm, whatever you want
+/gpd3d/gen/beamCenter 0 100 0     # only x/y used

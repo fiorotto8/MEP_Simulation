@@ -1,0 +1,11 @@
+filename,particle,n_events,minTheta,maxTheta
+photonAlbedo.csv,gamma,100000000,114,180
+neutronAlbedo.csv,neutron,10000000,114,180
+CXB.csv,gamma,1000000000,0,114
+primaryAlpha.csv,alpha,100000,0,114
+primaryElectrons.csv,e-,100000,0,114
+primaryPositrons.csv,e+,100000,0,114
+primaryProtons.csv,proton,100000,0,114
+secondaryElectrons.csv,e-,1000000,0,180
+secondaryPositrons.csv,e+,1000000,0,180
+secondaryProtons.csv,proton,1000000,0,180

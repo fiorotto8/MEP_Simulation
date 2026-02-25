@@ -1,0 +1,11 @@
+gpd3d_geo1_ar_co2/build/*
+gpd3d_geo1_ar_co2/spectra/*
+gpd3d_geo1_ar_co2/run_outputs/*
+./run_output*
+*.png
+*.root
+.vscode/*
+build/*
+debug/*
+plots/*
+__pycache__/*   

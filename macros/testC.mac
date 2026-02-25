@@ -1,0 +1,13 @@
+/gpd3d/bg/enable true
+/gpd3d/bg/writeFITS false
+
+/gpd3d/gen/useSphere true
+/gpd3d/gen/sphereRadius 450 mm
+/gpd3d/gen/sphereCenter 0 0 0 mm
+
+/gps/particle proton
+/gps/ene/type Mono
+/gps/ene/mono 10 MeV
+
+/run/initialize
+/run/beamOn 100

@@ -1,0 +1,48 @@
+/control/verbose 0
+/run/verbose 0
+/event/verbose 0
+/tracking/verbose 0
+/process/verbose 0
+/process/had/verbose 0
+
+# --- Background-mode switch (use the lightweight branch in EventAction)
+#     This disables the polarimetry/FITS workflow inside EndOfEventAction.
+#     Your python script then parses the printed summary as before.
+/gpd3d/bg/enable true
+
+# --- Disable FITS writing (since we're in background mode)
+/gpd3d/bg/writeFITS false
+
+# --- Enable ROOT output in background mode (Events + Hits TTrees)
+/gpd3d/bg/writeROOT true
+
+# --- Choose ROOT file name from macro (no strings stored in TTrees)
+# You can optionally use "%RUN%" in the filename if you want one file per runID.
+# Example: bg_%RUN%.root  -> bg_0.root, bg_1.root, ...
+#/gpd3d/bg/rootFile bg_%RUN%.root
+/gpd3d/bg/rootFile test.root
+
+# --- Your generator sphere settings (your existing workflow)
+#     This is independent from GPS position. Your code uses the sphere generator
+#     and your python injects /gps/particle and /gps/ene/mono.
+/gpd3d/gen/useSphere true
+/gpd3d/gen/sphereRadius 130 mm
+/gpd3d/gen/sphereCenter 0 0 0 mm
+/gpd3d/gen/posThetaMin 0 deg
+/gpd3d/gen/posThetaMin 180 deg
+
+# (script injects /gps/particle and /gps/ene/mono here)
+# ---- injected by rate_from_spectra.py ----
+/gps/particle gamma
+
+# Energy sampling from CSV spectrum (now in MeV, per your updated C++)
+/gpd3d/gen/useSpectrum true
+/gpd3d/gen/spectrumFile /ABS/PATH/TO/spectrum.csv
+
+# Optional (recommended if you run many processes in parallel with your python):
+# force one Geant4 worker thread per process to avoid oversubscribing CPUs
+# /run/numberOfThreads 1
+
+/run/initialize
+/run/printProgress 100
+/run/beamOn 100

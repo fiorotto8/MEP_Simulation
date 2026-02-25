@@ -1,0 +1,71 @@
+/gpd3d/bg/enable true
+/gpd3d/bg/writeFITS false
+
+/gpd3d/gen/useSphere true
+/gpd3d/gen/sphereRadius 100.0 mm
+/gpd3d/gen/sphereCenter 0 0 0 mm
+
+/gps/particle gamma
+/gps/ene/type Mono
+/gps/ene/mono 0.002220208854459048 MeV
+
+# ==================================
+# vis_tracks_startpoint_robust.mac
+# ==================================
+
+/run/initialize
+/vis/initialize
+
+# Viewer: choose one you actually use (uncomment only one)
+/vis/open OGLSQt 1200x900-0+0
+#/vis/open OGLIQt 1200x900-0+0
+#/vis/open OGLSX 1200x900-0+0
+#/vis/open OGLIX 1200x900-0+0
+
+# Avoid "display list limit reached" for stored viewers
+/vis/ogl/set/displayListLimit 200000
+
+# Basic view
+/vis/viewer/set/autoRefresh true
+/vis/viewer/set/viewpointThetaPhi 75 20
+/vis/viewer/zoom 1.2
+
+# Draw geometry
+/vis/drawVolume
+/vis/scene/add/axes 0 0 0 100 mm
+
+# ---- Trajectories
+# 2 = store trajectories with rich info (what you already used)
+/tracking/storeTrajectory 2
+
+# Draw smooth trajectories and ALSO draw step points
+/vis/scene/add/trajectories smooth
+/vis/modeling/trajectories/create/drawByCharge
+/vis/modeling/trajectories/drawByCharge-0/default/setLineWidth 2
+
+# Make step points big so the start point is obvious.
+# (Geant4 draws step points along the track; the very first one is the vertex)
+/vis/modeling/trajectories/drawByCharge-0/default/setDrawStepPts true
+/vis/modeling/trajectories/drawByCharge-0/default/setStepPtsSize 6
+
+# If you want *only* a few points (less clutter), turn off step points and use "markers"
+# but marker commands differ by version, so step points is the safest.
+
+# Keep/clear behavior
+# Clear each event (lighter, avoids memory + display list growth)
+#/vis/scene/endOfEventAction refresh
+
+# Or accumulate but keep only N events
+/vis/scene/endOfEventAction accumulate 10
+
+# Verbosity
+/control/verbose 1
+/run/verbose 0
+/event/verbose 0
+/tracking/verbose 0
+
+# Run
+/run/beamOn 5
+
+# If you accumulated, to inspect:
+/vis/reviewKeptEvents

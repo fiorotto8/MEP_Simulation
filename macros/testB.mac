@@ -1,0 +1,19 @@
+# ---------- Background-mode test: protons ----------
+/control/verbose 1
+/run/verbose 1
+/event/verbose 0
+/tracking/verbose 0
+
+/gpd3d/bg/enable true
+/gpd3d/bg/writeFITS false
+
+/gps/particle proton
+/gps/ene/type Mono
+/gps/ene/mono 10 MeV
+
+/gps/pos/type Point
+/gps/pos/centre 0 0 100 mm
+/gps/direction 0 0 -1
+
+/run/initialize
+/run/beamOn 2000
