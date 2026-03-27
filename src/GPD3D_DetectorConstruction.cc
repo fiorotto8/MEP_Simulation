@@ -100,6 +100,7 @@ G4VPhysicalVolume* GPD3D_DetectorConstruction::Construct()
   auto Cu = nist->FindOrBuildMaterial("G4_Cu");
   auto Be = nist->FindOrBuildMaterial("G4_Be");
   auto Kapton = nist->FindOrBuildMaterial("G4_KAPTON");
+  auto W  = nist->FindOrBuildMaterial("G4_W");
 
   const G4double Tgas = 293.15*kelvin;
   const G4double Pgas = 3.0*atmosphere;
@@ -234,9 +235,10 @@ G4VPhysicalVolume* GPD3D_DetectorConstruction::Construct()
   const G4double alBoxThick   = 1.5*mm;      // wall thickness
 
   // hole on +Z face (choose one)
-  const G4double alHoleRadius = 1.0*cm;      // example: 3 cm radius
+  const G4double alHoleRadius = 1.5/2.*cm;      // example: 3 cm radius
   // if you prefer a square hole:
   // const G4double alHoleSide   = 6.0*cm;
+  const G4double wPlugThick = 1.0*mm;
 
 
   // ---------- SOLIDS ----------
@@ -491,6 +493,54 @@ G4VPhysicalVolume* GPD3D_DetectorConstruction::Construct()
 
   // ---------- AL BOX LOGICAL VOLUME ----------
   auto lvAlBox = new G4LogicalVolume(sAlShellWithHole, Al, "AlBoxShell_LV");
+
+  // ---------- TUNGSTEN PLUG FOR +Z HOLE ----------
+  auto sWPlug = new G4Tubs("WPlug_S",
+                          0., alHoleRadius,
+                          wPlugThick/2.,
+                          0.*deg, 360.*deg);
+  auto lvWPlug = new G4LogicalVolume(sWPlug, W, "WPlug_LV");
+  auto visWPlug = new G4VisAttributes(G4Colour(0.2,0.2,0.2,0.9));
+  visWPlug->SetForceSolid(true);
+  lvWPlug->SetVisAttributes(visWPlug);
+  const G4double zWPlug = detZc + zHoleLocal;
+  new G4PVPlacement(nullptr,
+                  G4ThreeVector(0,0,zWPlug),
+                  lvWPlug,
+                  "WPlug_PV",
+                  worldLV,
+                  false, 301,
+                  overlapCheck);
+
+    // Tungsten tube extending from the plug toward +Z
+  const G4double wTubeInnerR = alHoleRadius;
+  const G4double wTubeThick  = 0.2*mm;
+  const G4double wTubeOuterR = wTubeInnerR + wTubeThick;
+  const G4double wTubeLength = 10.0*cm;
+
+  auto sWTube = new G4Tubs("WTube_S",
+                           wTubeInnerR,
+                           wTubeOuterR,
+                           wTubeLength/2.,
+                           0.*deg, 360.*deg);
+
+  auto lvWTube = new G4LogicalVolume(sWTube, W, "WTube_LV");
+
+  auto visWTube = new G4VisAttributes(G4Colour(0.15,0.15,0.15,0.9));
+  visWTube->SetForceSolid(true);
+  lvWTube->SetVisAttributes(visWTube);
+
+  // Tube starts at the outer face of the plug and extends toward +Z
+  const G4double zWTube = zWPlug + wPlugThick/2. + wTubeLength/2.;
+
+  new G4PVPlacement(nullptr,
+                    G4ThreeVector(0,0,zWTube),
+                    lvWTube,
+                    "WTube_PV",
+                    worldLV,
+                    false, 302,
+                    overlapCheck);
+
 
   // visualization
   auto visAlBox = new G4VisAttributes(G4Colour(0.7,0.7,0.7,0.15));

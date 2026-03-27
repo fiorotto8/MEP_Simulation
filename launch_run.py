@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import re
 import math
@@ -24,19 +25,6 @@ TEMPLATE_MAC = Path("macros/template_bg_sphere_spectrum.mac")
 SPHERE_RADIUS_MM = 130.0
 
 MAX_WORKERS = os.cpu_count()
-
-# Output
-OUTDIR = Path("run_outputs_highstats")
-OUTDIR.mkdir(parents=True, exist_ok=True)
-
-OUT_ROOTDIR = OUTDIR / "root"
-OUT_ROOTDIR.mkdir(parents=True, exist_ok=True)
-
-OUT_RUNCSV = OUTDIR / "run_points.csv"
-OUT_RUNJSON = OUTDIR / "run_points.json"
-OUT_SUMCSV = OUTDIR / "run_summary.csv"
-OUT_PNG_RATE = OUTDIR / "rates_overview.png"
-OUT_PNG_PHIT = OUTDIR / "phit_overview.png"
 
 # ---------- PARSING ----------
 RE_P_HIT = re.compile(r"P\(hit\):\s*([0-9eE+\-\.]+)")
@@ -340,6 +328,18 @@ def save_summary_csv(rows, path: Path):
         for r in rows:
             w.writerow(r)
 
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Run the Geant4 simulation over all manifest entries and save ROOT outputs plus summaries."
+    )
+    p.add_argument(
+        "--outdir",
+        type=Path,
+        default=Path("run_outputs"),
+        help="Output directory for ROOT files and run summaries (default: run_outputs).",
+    )
+    return p.parse_args()
+
 def make_overview_plots(points_rows):
     # With spectrum sampling in Geant4, there are no per-energy points to plot.
     # Keeping this function as a no-op to avoid breaking the pipeline.
@@ -412,6 +412,17 @@ def _worker_run_manifest_item(args):
     return summary, points
 
 def main():
+    args = parse_args()
+    outdir = args.outdir
+    outdir.mkdir(parents=True, exist_ok=True)
+    out_rootdir = outdir / "root"
+    out_rootdir.mkdir(parents=True, exist_ok=True)
+    out_runcsv = outdir / "run_points.csv"
+    out_runjson = outdir / "run_points.json"
+    out_sumcsv = outdir / "run_summary.csv"
+    out_png_rate = outdir / "rates_overview.png"
+    out_png_phit = outdir / "phit_overview.png"
+
     if not TEMPLATE_MAC.exists():
         raise FileNotFoundError(f"Missing {TEMPLATE_MAC}")
     if not MANIFEST.exists():
@@ -436,7 +447,7 @@ def main():
             particle,
             SPHERE_RADIUS_MM,
             n_events,
-            str(OUT_ROOTDIR),
+            str(out_rootdir),
             tmin_deg,
             tmax_deg
         ))
@@ -448,7 +459,7 @@ def main():
 
     print(f"Running {len(worker_args)} manifest entries in parallel "
           f"(max_workers={MAX_WORKERS or os.cpu_count()})")
-    print(f"ROOT outputs under: {OUT_ROOTDIR}")
+    print(f"ROOT outputs under: {out_rootdir}")
 
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as pool:
         fut_map = {pool.submit(_worker_run_manifest_item, a): a for a in worker_args}
@@ -473,11 +484,11 @@ def main():
     #all_points.sort(key=lambda r: (r["source_file"], r["particle"], r["E_MeV"]))
     all_points.sort(key=lambda r: (r["source_file"], r["particle"]))
 
-    save_points_csv(all_points, OUT_RUNCSV)
-    with open(OUT_RUNJSON, "w") as f:
+    save_points_csv(all_points, out_runcsv)
+    with open(out_runjson, "w") as f:
         json.dump(all_points, f, indent=2)
 
-    save_summary_csv(results, OUT_SUMCSV)
+    save_summary_csv(results, out_sumcsv)
     make_overview_plots(all_points)
 
     print("\n================ SUMMARY ================")
@@ -488,12 +499,12 @@ def main():
     print(f"TOTAL HIT RATE: {total_rate:.6g} 1/s")
     print("========================================\n")
 
-    print(f"Saved point-by-point: {OUT_RUNCSV}")
-    print(f"Saved point-by-point: {OUT_RUNJSON}")
-    print(f"Saved summary:        {OUT_SUMCSV}")
-    print(f"Saved plots:          {OUT_PNG_RATE}")
-    print(f"Saved plots:          {OUT_PNG_PHIT}")
-    print(f"Saved ROOT files:     {OUT_ROOTDIR}")
+    print(f"Saved point-by-point: {out_runcsv}")
+    print(f"Saved point-by-point: {out_runjson}")
+    print(f"Saved summary:        {out_sumcsv}")
+    print(f"Saved plots:          {out_png_rate}")
+    print(f"Saved plots:          {out_png_phit}")
+    print(f"Saved ROOT files:     {out_rootdir}")
 
 if __name__ == "__main__":
     main()

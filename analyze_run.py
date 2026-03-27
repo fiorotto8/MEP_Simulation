@@ -1,535 +1,643 @@
 #!/usr/bin/env python3
-import os
-import re
-import math
-import logging
-from dataclasses import dataclass
+"""
+Refactored from Analysis_S.ipynb.
+
+Computes flux-density histograms from Geant4 ROOT outputs and produces plots:
+1) Entire gas volume (total + per-source)
+2) Timepix-only hits (total + per-source)
+3) Timepix-only hits with Gaussian smearing (total + per-source)
+
+Requires:
+- numpy, awkward, uproot, matplotlib, scipy, tqdm
+- your local `analyze_run.py` (imported as ar)
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import csv
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from optparse import OptionParser
-from collections import defaultdict
+from typing import Dict, Tuple
+
 import numpy as np
+import awkward as ak
 import uproot
-
-# Optional but strongly recommended for jagged arrays output
-try:
-    import awkward as ak
-except Exception as e:
-    ak = None
-
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import scipy.stats as st
+from tqdm import tqdm
 
+# Make sure analyze_run.py is importable (same policy as the notebook: sys.path.append("../"))
+THIS_DIR = Path(__file__).resolve().parent
+sys.path.append(str(THIS_DIR.parent))
+import analyze_run as ar  # noqa: E402
 
-# -----------------------------
-# Config
-# -----------------------------
-SPHERE_RADIUS_MM = 130.0
+def load_theta_limits_from_manifest(manifest_csv: Path) -> dict[str, tuple[float, float]]:
+    out = {}
+    with manifest_csv.open() as f:
+        rdr = csv.DictReader(f)
+        for row in rdr:
+            fn = row["filename"].strip()
+            tmin = float(row["minTheta"])
+            tmax = float(row["maxTheta"])
+            out[fn] = (tmin, tmax)               # full name
+            out[Path(fn).stem] = (tmin, tmax)    # stem
+    return out
 
-BASE_DIR = Path("run_outputs")
-SPECTRA_DIR = Path("spectra")
-PLOTS_DIR = BASE_DIR / "plots"
-#PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+def compute_f_from_theta(R_mm: float, tmin_deg: float, tmax_deg: float) -> float:
+    R_cm = R_mm / 10.0
+    tmin = np.deg2rad(tmin_deg)
+    tmax = np.deg2rad(tmax_deg)
+    tmin = np.clip(tmin, 0.0, np.pi)
+    tmax = np.clip(tmax, 0.0, np.pi)
+    if tmax <= tmin:
+        tmin, tmax = 0.0, np.pi
+    A_patch = 2.0 * np.pi * (R_cm**2) * (np.cos(tmin) - np.cos(tmax))
+    return np.pi * A_patch
 
-OUTFILE = Path("summary_all_branches.root")
-
-ENERGY_RE = re.compile(r"E([\d.]+)MeV")
-
-
-# -----------------------------
-# Logging
-# -----------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)s: %(message)s",
-)
-log = logging.getLogger("analyze_run")
-
-
-# -----------------------------
-# Data structures
-# -----------------------------
-@dataclass(frozen=True)
-class FileMeta:
-    source: str
-    particle: str
-    energy_MeV: float
-    filename: str
-    path: Path
-
-
-@dataclass
-class FileData:
-    n_beam: int
-    edep_keV: np.ndarray  # 1D array
-    num_hits: int
-    hit_prob: float
-    err_hit_prob: float
-
-
-# -----------------------------
-# File discovery / parsing
-# -----------------------------
-def parse_root_filename(filename: str) -> Optional[Tuple[str, str, float]]:
+def compute_integrated_rate(y: np.ndarray, sy: np.ndarray, bin_width_keV: float) -> tuple[float, float]:
     """
-    Expected pattern: <source>_<particle>_..._E<energy>MeV.root
-    Returns (source, particle, energy_MeV) or None if it can't parse.
+    Integrated rate R = sum_i y_i * ΔE.
+    Uncertainty σ_R from quadrature: sqrt(sum_i (σ_i * ΔE)^2).
+
+    Assumes `y` is a flux density per keV (or per bin_width_keV unit) and `sy` its 1σ uncertainty.
     """
-    if not filename.endswith(".root"):
-        return None
-    stem = filename[:-5]
-    parts = stem.split("_")
-    if len(parts) < 2:
-        return None
+    y = np.asarray(y, dtype=float)
+    sy = np.asarray(sy, dtype=float)
+    bw = float(bin_width_keV)
+    rate = float(np.sum(y * bw))
+    srate = float(np.sqrt(np.sum((sy * bw) ** 2)))
+    return rate, srate
 
-    source = parts[0]
-    particle = parts[1]
+def save_integrated_rates_csv_per_source(
+    out_csv: Path,
+    directory: Path,
+    energy_min_keV: float,
+    energy_max_keV: float,
+    bin_width_keV: float,
+    s_smearing: float,
+    rates_by_case: dict[str, dict[str, tuple[float, float]]],
+) -> None:
+    """
+    Save integrated rates *per source* for multiple cases to CSV.
 
-    m = ENERGY_RE.search(stem)
-    energy = float(m.group(1)) if m else float("nan")
-    return source, particle, energy
+    `rates_by_case` maps:
+        case -> { source_name -> (rate, uncertainty) }
+
+    A "Total" source row can be included in each case dict.
+    """
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "case",
+        "source",
+        "integrated_rate_1_over_s",
+        "sigma_1_over_s",
+        "directory",
+        "energy_min_keV",
+        "energy_max_keV",
+        "bin_width_keV",
+        "s_smearing",
+    ]
+
+    with out_csv.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for case, per_source in rates_by_case.items():
+            # stable ordering: Total first if present, then alphabetical
+            sources = list(per_source.keys())
+            ordered = []
+            if "Total" in per_source:
+                ordered.append("Total")
+            ordered += sorted([s for s in sources if s != "Total"])
+
+            for src in ordered:
+                r, sr = per_source[src]
+                w.writerow(
+                    {
+                        "case": case,
+                        "source": src,
+                        "integrated_rate_1_over_s": f"{r:.10g}",
+                        "sigma_1_over_s": f"{sr:.10g}",
+                        "directory": str(directory),
+                        "energy_min_keV": f"{energy_min_keV:.10g}",
+                        "energy_max_keV": f"{energy_max_keV:.10g}",
+                        "bin_width_keV": f"{bin_width_keV:.10g}",
+                        "s_smearing": f"{s_smearing:.10g}",
+                    }
+                )
 
 
-def find_root_files(base_dir: Path = BASE_DIR) -> List[FileMeta]:
-    out: List[FileMeta] = []
-    for root, _, files in os.walk(base_dir):
-        rootp = Path(root)
-        for fn in files:
-            if not fn.endswith(".root"):
-                continue
-            parsed = parse_root_filename(fn)
-            if not parsed:
-                continue
-            source, particle, energy = parsed
-            out.append(FileMeta(source, particle, energy, fn, rootp / fn))
+def split_by_n(n, vec):
+    """
+    Split `vec` into consecutive chunks whose lengths are given by `n`.
 
-    out.sort(key=lambda x: (x.source, x.particle, x.energy_MeV, x.filename))
+    Example:
+        n = [2, 3, 1], vec = [10,11,12,13,14,15]
+        -> [ [10,11], [12,13,14], [15] ]
+
+    Returns a list of numpy arrays (or list slices if vec isn't array-like).
+    """
+    n = np.asarray(n, dtype=int)
+    if n.ndim != 1:
+        raise ValueError("`n` must be a 1D array of chunk sizes.")
+    if np.any(n < 0):
+        raise ValueError("All chunk sizes must be non-negative.")
+    if np.sum(n) != len(vec):
+        raise ValueError(f"sum(n)={np.sum(n)} does not match len(vec)={len(vec)}")
+
+    out = []
+    start = 0
+    for size in n:
+        out.append(vec[start : start + size])
+        start += size
     return out
 
 
-# -----------------------------
-# Spectra utilities
-# -----------------------------
-def compute_dE_per_entry(out_source: List[str], out_energy: List[float]) -> np.ndarray:
+def compute_histograms(
+    directory: Path,
+    energy_min_keV: float,
+    energy_max_keV: float,
+    bin_width_keV: float,
+    s_smearing: float,
+    spectra_directory: Path,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray], Dict[str, np.ndarray],
+           np.ndarray, np.ndarray, Dict[str, np.ndarray], Dict[str, np.ndarray],
+           np.ndarray, np.ndarray, Dict[str, np.ndarray], Dict[str, np.ndarray], np.ndarray]:
     """
-    For each entry (file), compute an effective energy step dE (MeV)
-    based on the spacing of simulated energies within each source.
-    Midpoint rule for interior points, one-sided for edges.
+    Returns:
+      bins,
+      standard:              (yh_tot, syh_tot, yh_source, syh_source),
+      timepix cut:           (yh_tot_tp, syh_tot_tp, yh_source_tp, syh_source_tp),
+      timepix + smearing:    (yh_tot_tp_sm, syh_tot_tp_sm, yh_source_tp_sm, syh_source_tp_sm),
+      timepix + smear + veto:(yh_tot_tp_sm_g, syh_tot_tp_sm_g, yh_source_tp_sm_g, syh_source_tp_sm_g),
+      timepix + smear + IN:  (yh_tot_tp_sm_gin, syh_tot_tp_sm_gin, yh_source_tp_sm_gin, syh_source_tp_sm_gin),
+      sources
     """
-    N = len(out_source)
-    dE = np.zeros(N, dtype=np.float64)
+    spectra_tables = ar.load_spectra_table(spectra_directory)
 
-    by_src = defaultdict(list)
-    for i, src in enumerate(out_source):
-        by_src[src].append(i)
+    files = ar.find_root_files(directory)
+    if len(files) == 0:
+        raise FileNotFoundError(f"No ROOT files found under: {directory}")
 
-    for src, idxs in by_src.items():
-        idxs = sorted(idxs, key=lambda i: out_energy[i])
-        E = np.array([out_energy[i] for i in idxs], dtype=np.float64)
+    sources = np.unique([info.source for info in files])
+    paths: Dict[str, list[Path]] = {s: [] for s in sources}
+    print("DEBUG sources:", sources)
 
-        if len(E) < 2:
-            dE[idxs[0]] = 0.0
-            continue
+    for info in files:
+        paths[info.source].append(info.path)
 
-        dEi = np.empty_like(E)
-        dEi[0]  = E[1] - E[0]
-        dEi[-1] = E[-1] - E[-2]
-        if len(E) > 2:
-            dEi[1:-1] = 0.5 * (E[2:] - E[:-2])
+    bins = np.arange(energy_min_keV, energy_max_keV + bin_width_keV, bin_width_keV)
 
-        for j, i in enumerate(idxs):
-            dE[i] = float(dEi[j])
+    timepix_side_mm = 14.08
 
-    return dE
+    # totals
+    yh_tot = np.zeros(len(bins) - 1)
+    syh_tot = np.zeros(len(bins) - 1)
+    yh_source: Dict[str, np.ndarray] = {}
+    syh_source: Dict[str, np.ndarray] = {}
 
+    # timepix-only
+    yh_tot_tp = np.zeros(len(bins) - 1)
+    syh_tot_tp = np.zeros(len(bins) - 1)
+    yh_source_tp: Dict[str, np.ndarray] = {}
+    syh_source_tp: Dict[str, np.ndarray] = {}
 
-def load_spectra_table(spectra_dir: Path = SPECTRA_DIR) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
-    """
-    Returns dict: source_name -> (E_sorted, F_sorted)
-    CSV format: E, fluxSpace  (comma-separated)
-    Key is filename without extension.
-    """
-    tables: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
-    for fn in spectra_dir.iterdir():
-        if fn.suffix.lower() != ".csv":
-            continue
-        if fn.name == "manifest.csv":
-            continue
+    # timepix + smearing
+    yh_tot_tp_sm = np.zeros(len(bins) - 1)
+    syh_tot_tp_sm = np.zeros(len(bins) - 1)
+    yh_source_tp_sm: Dict[str, np.ndarray] = {}
+    syh_source_tp_sm: Dict[str, np.ndarray] = {}
 
-        arr = np.loadtxt(fn, delimiter=",")
-        if arr.ndim == 1 and arr.size == 2:
-            arr = arr.reshape(1, 2)
-
-        E = arr[:, 0].astype(float)
-        F = arr[:, 1].astype(float)
-
-        idx = np.argsort(E)
-        tables[fn.stem] = (E[idx], F[idx])
-
-    return tables
-
-
-def interp_flux_loglog(E_grid: np.ndarray, F_grid: np.ndarray, E_query: float) -> float:
-    """
-    Log-log interpolation. NaN if out of range or invalid.
-    Falls back to linear interpolation if logs not possible.
-    """
-    if not np.isfinite(E_query) or E_query <= 0:
-        return float("nan")
-    if E_grid.size < 2:
-        return float("nan")
-    if E_query < E_grid[0] or E_query > E_grid[-1]:
-        return float("nan")
-
-    if np.any(E_grid <= 0) or np.any(F_grid <= 0):
-        return float(np.interp(E_query, E_grid, F_grid))
-
-    logE = np.log(E_grid)
-    logF = np.log(F_grid)
-    val = np.interp(np.log(E_query), logE, logF)
-    return float(np.exp(val))
-
-
-def compute_rate(flux_space: float, sphere_radius_mm: float, prob_hit: float, err_prob_hit: float) -> Tuple[float, float]:
-    """
-    Your original formula:
-      area_cm2 = 4*pi*(R_cm)^2
-      rate = pi * fluxSpace * area_cm2 * prob_hit
-    """
-    if not np.isfinite(flux_space):
-        return float("nan"), float("nan")
-    area_cm2 = 4.0 * math.pi * (sphere_radius_mm / 10.0) ** 2
-    rate = math.pi * flux_space * area_cm2 * prob_hit
-    err_rate = math.pi * flux_space * area_cm2 * err_prob_hit
-    return rate, err_rate
-
-
-# -----------------------------
-# ROOT reading with uproot
-# -----------------------------
-def read_file_data(path: Path) -> FileData:
-    """
-    Reads RunInfo/nBeamOnRequested and Events/edepGasTotal_keV.
-    Returns hit probability and binomial error.
-    """
-    with uproot.open(path) as f:
-        n_beam = -1
-        if "RunInfo" in f and "nBeamOnRequested" in f["RunInfo"]:
-            arr = f["RunInfo"]["nBeamOnRequested"].array(library="np")
-            if len(arr):
-                n_beam = int(arr[0])
-
-        edep = np.empty(0, dtype=np.float64)
-        if "Events" in f and "edepGasTotal_keV" in f["Events"]:
-            edep = f["Events"]["edepGasTotal_keV"].array(library="np")
-
-        num_hits = int(len(edep))
-        hit_prob = (num_hits / n_beam) if n_beam > 0 else 0.0
-        err_hit_prob = math.sqrt(hit_prob * (1.0 - hit_prob) / n_beam) if n_beam > 0 else 0.0
-
-        return FileData(n_beam=n_beam, edep_keV=edep, num_hits=num_hits, hit_prob=hit_prob, err_hit_prob=err_hit_prob)
-
-
-# -----------------------------
-# Plotting
-# -----------------------------
-def plot_all_flux_spectra(spectra_tables: Dict[str, Tuple[np.ndarray, np.ndarray]]) -> None:
-    if not spectra_tables:
-        return
-    plt.figure()
-    for src, (E, F) in spectra_tables.items():
-        plt.loglog(E, F, marker="o", linestyle="-", label=src)
-    plt.xlabel("Primary Particle Energy (MeV)")
-    plt.ylabel("Flux Spectra")
-    plt.title("Flux Spectra for All Sources")
-    plt.legend(fontsize="small")
-    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
-    plt.savefig(PLOTS_DIR / "flux_spectra_all_sources.png", dpi=150, bbox_inches="tight")
-    plt.close()
-
-
-def plot_hitprob_vs_energy(per_source: Dict[str, Dict[str, List[float]]]) -> None:
-    if not per_source:
-        return
-    plt.figure()
-    for src, d in per_source.items():
-        plt.errorbar(d["energy"], d["hitProb"], yerr=d["err_hitProb"], fmt="o", label=src)
-    plt.xscale("log")
-    plt.yscale("log")
-    plt.xlabel("Primary Particle Energy (MeV)")
-    plt.ylabel("Hit Probability")
-    plt.title("Hit Probability vs Energy (per source)")
-    plt.legend(fontsize="small")
-    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
-    plt.savefig(PLOTS_DIR / "hit_probability_vs_energy.png", dpi=150, bbox_inches="tight")
-    plt.close()
-
-
-def plot_edep_histograms_weighted(
-    sources: List[str],
-    out_source: List[str],
-    out_edep_lists: List[List[float]],
-    out_numhits: List[int],
-    w_perHit: np.ndarray,
-    plots_dir: Path,
-) -> None:
-
-    # find global min/max over all edep values (for common bins)
-    global_min, global_max = None, None
-    for ed in out_edep_lists:
-        if len(ed) == 0:
-            continue
-        mn, mx = float(np.min(ed)), float(np.max(ed))
-        global_min = mn if global_min is None else min(global_min, mn)
-        global_max = mx if global_max is None else max(global_max, mx)
-
-    if global_min is None:
-        log.warning("No edepGasTotal_keV values found for any source")
-        return
-
-    bins = np.linspace(0.99 * global_min, 1.01 * global_max, 101)  # 100 bins
-    binw = np.diff(bins)
-
-    total_hist = np.zeros(len(bins) - 1, dtype=np.float64)
-
-    # --- Per-source weighted spectra ---
-    for src in sources:
-        h_src = np.zeros(len(bins) - 1, dtype=np.float64)
-
-        for i, s in enumerate(out_source):
-            if s != src:
-                continue
-            if out_numhits[i] <= 0:
-                continue
-            if not np.isfinite(w_perHit[i]) or w_perHit[i] <= 0:
-                continue
-            ed = np.asarray(out_edep_lists[i], dtype=np.float64)
-            if ed.size == 0:
-                continue
-
-            # each hit in this entry gets the same weight
-            weights = np.full(ed.shape, w_perHit[i], dtype=np.float64)
-            hi, _ = np.histogram(ed, bins=bins, weights=weights)
-            h_src += hi
-
-        if np.all(h_src == 0):
-            log.warning("Weighted spectrum is empty for source %s", src)
-            continue
-
-        total_hist += h_src
-
-        # Plot as a density (per keV) in "flux units" (whatever fluxSpace units are)
-        h_src_per_keV = h_src / binw
-
-        plt.figure()
-        plt.bar(bins[:-1], h_src_per_keV, width=binw, alpha=0.7, align="edge")
-        plt.title(f"Flux-weighted Edep spectrum: {src}")
-        plt.xlabel("Energy Deposition (keV)")
-        plt.ylabel("Weighted counts / keV")
-        plt.grid(True, linestyle="--", linewidth=0.5)
-        plt.savefig(plots_dir / f"flux_weighted_edep_spectrum_{src}.png", dpi=150, bbox_inches="tight")
-        plt.close()
-
-        # Optional: also save a shape-only normalized PDF (area=1)
-        area = float(np.sum(h_src_per_keV * binw))
-        if area > 0:
-            pdf_per_keV = h_src_per_keV / area
-            plt.figure()
-            plt.bar(bins[:-1], pdf_per_keV, width=binw, alpha=0.7, align="edge")
-            plt.title(f"Flux-weighted Edep PDF (area=1): {src}")
-            plt.xlabel("Energy Deposition (keV)")
-            plt.ylabel("PDF / keV")
-            plt.grid(True, linestyle="--", linewidth=0.5)
-            plt.savefig(plots_dir / f"flux_weighted_edep_pdf_{src}.png", dpi=150, bbox_inches="tight")
-            plt.close()
-
-    # --- Total combined weighted spectrum (all sources) ---
-    if np.any(total_hist > 0):
-        total_per_keV = total_hist / binw
-
-        plt.figure()
-        plt.bar(bins[:-1], total_per_keV, width=binw, alpha=0.7, align="edge")
-        plt.title("Total flux-weighted Edep spectrum (all sources)")
-        plt.xlabel("Energy Deposition (keV)")
-        plt.ylabel("Weighted counts / keV")
-        plt.grid(True, linestyle="--", linewidth=0.5)
-        plt.savefig(plots_dir / "total_flux_weighted_edep_spectrum.png", dpi=150, bbox_inches="tight")
-        plt.close()
-
-        area = float(np.sum(total_per_keV * binw))
-        if area > 0:
-            total_pdf_per_keV = total_per_keV / area
-            plt.figure()
-            plt.bar(bins[:-1], total_pdf_per_keV, width=binw, alpha=0.7, align="edge")
-            plt.title("Total flux-weighted Edep PDF (area=1, all sources)")
-            plt.xlabel("Energy Deposition (keV)")
-            plt.ylabel("PDF / keV")
-            plt.grid(True, linestyle="--", linewidth=0.5)
-            plt.savefig(plots_dir / "total_flux_weighted_edep_pdf.png", dpi=150, bbox_inches="tight")
-            plt.close()
-
-
-# -----------------------------
-# Writing output with uproot (no PyROOT)
-# -----------------------------
-def write_summary_root(outfile: Path, rows: Dict[str, object]) -> None:
-    """
-    Writes a TTree named FileSummary to `outfile`.
-    `rows` is a dict of branchname -> array-like (numpy arrays or awkward arrays).
-    """
-    with uproot.recreate(outfile) as fout:
-        tree = fout.mktree("FileSummary", rows)  # creates a TTree (not an RNTuple)
-        tree.extend(rows)          
-
-
-# -----------------------------
-# Main pipeline
-# -----------------------------
-def main() -> None:
-
-    directory         = None
-    spectra_directory = None
-    outfile           = None
-    plots_dir         = None
-    parser = OptionParser(usage='usage: %prog -t <base_directory> -s <spectra_directory -o <output_root_file> -p <plots_directory>')
-    parser.add_option('-t', '--directory', dest='directory', default=BASE_DIR, help='Base directory to search for ROOT files (default: %s)' % directory)
-    parser.add_option('-s', '--spectra', dest='spectra_directory', default=SPECTRA_DIR, help='Directory to load spectra tables from (default: %s)' % SPECTRA_DIR)
-    parser.add_option('-o', '--output', dest='outfile', default=OUTFILE, help='Output ROOT file path (default: %s)' % OUTFILE)
-    parser.add_option('-p', '--plots', dest='plots_directory', default=PLOTS_DIR, help='Directory to save plots (default: %s)' % PLOTS_DIR)
-    (options, args) = parser.parse_args()
-
-    directory         = options.directory
-    spectra_directory = options.spectra_directory
-    outfile           = options.outfile
-    plots_dir         = options.plots_directory
-
-    if not os.path.exists(plots_dir):
-        os.makedirs(plots_dir)
+    # timepix + smearing + GAGG
+    yh_tot_tp_sm_g = np.zeros(len(bins) - 1)
+    syh_tot_tp_sm_g = np.zeros(len(bins) - 1)
+    yh_source_tp_sm_g: Dict[str, np.ndarray] = {}
+    syh_source_tp_sm_g: Dict[str, np.ndarray] = {}
     
-    files = find_root_files(directory)
-    if not files:
-        log.error("No ROOT files found under %s", directory)
-        return
+    # --- NEW: timepix + smearing + GAGG in (on_gagg == 1) ---
+    yh_tot_tp_sm_gin = np.zeros(len(bins) - 1)
+    syh_tot_tp_sm_gin = np.zeros(len(bins) - 1)
+    yh_source_tp_sm_gin: Dict[str, np.ndarray] = {}
+    syh_source_tp_sm_gin: Dict[str, np.ndarray] = {}
 
-    spectra_tables = load_spectra_table(spectra_directory)
+    # --- NEW: normalization from manifest (theta-limited sphere patch) ---
+    manifest_csv = spectra_directory / "manifest.csv"
+    if not manifest_csv.exists():
+        raise FileNotFoundError(f"Missing manifest.csv in spectra_dir: {manifest_csv}")
 
-    # Plot all spectra
-    plot_all_flux_spectra(spectra_tables)
+    theta_map = load_theta_limits_from_manifest(manifest_csv)
 
-    # Collect per-source hitProb for plotting
-    per_source: Dict[str, Dict[str, List[float]]] = {}
+    # sphere radius in mm: keep consistent with your generator
+    # ideally pass as argument; for now use the same constant as in generation
+    sphere_radius_mm = 130.0
 
-    # Output columns
-    out_source: List[str] = []
-    out_particle: List[str] = []
-    out_filename: List[str] = []
-    out_energy: List[float] = []
-    out_nbeam: List[int] = []
-    out_numhits: List[int] = []
-    out_hitprob: List[float] = []
-    out_err_hitprob: List[float] = []
-    out_flux: List[float] = []
-    out_rate: List[float] = []
-    out_err_rate: List[float] = []
-    out_edep_lists: List[List[float]] = []
+    f_by_source: Dict[str, float] = {}
+    missing = []
+    for s in sources:
+        if s not in theta_map:
+            missing.append(s)
+            continue
+        tmin_deg, tmax_deg = theta_map[s]
+        f_by_source[s] = compute_f_from_theta(sphere_radius_mm, tmin_deg, tmax_deg)
 
-    log.info("Processing %d files...", len(files))
-    for i, info in enumerate(files, 1):
-        try:
-            data = read_file_data(info.path)
-
-            # fluxSpace from spectra table matching the "source"
-            if info.source in spectra_tables and np.isfinite(info.energy_MeV):
-                Egrid, Fgrid = spectra_tables[info.source]
-                flux_space = interp_flux_loglog(Egrid, Fgrid, float(info.energy_MeV))
-            else:
-                flux_space = float("nan")
-
-            rate, err_rate = compute_rate(flux_space, SPHERE_RADIUS_MM, data.hit_prob, data.err_hit_prob)
-
-            # Fill lists
-            out_source.append(info.source)
-            out_particle.append(info.particle)
-            out_filename.append(info.filename)
-            out_energy.append(float(info.energy_MeV))
-            out_nbeam.append(int(data.n_beam))
-            out_numhits.append(int(data.num_hits))
-            out_hitprob.append(float(data.hit_prob))
-            out_err_hitprob.append(float(data.err_hit_prob))
-            out_flux.append(float(flux_space))
-            out_rate.append(float(rate))
-            out_err_rate.append(float(err_rate))
-            out_edep_lists.append([float(x) for x in data.edep_keV])
-
-            # per-source for plot
-            per_source.setdefault(info.source, {"energy": [], "hitProb": [], "err_hitProb": []})
-            per_source[info.source]["energy"].append(float(info.energy_MeV))
-            per_source[info.source]["hitProb"].append(float(data.hit_prob))
-            per_source[info.source]["err_hitProb"].append(float(data.err_hit_prob))
-
-            if i % 50 == 0:
-                log.info("  %d/%d done", i, len(files))
-
-        except Exception as e:
-            log.error("Failed on %s: %s", info.filename, e)
-
-    # Plots using collected values
-    plot_hitprob_vs_energy(per_source)
-
-    # Prepare branches for writing
-    if ak is None:
-        log.error(
-            "awkward is not available, so I can't write the jagged edepGasTotal_keV branch safely.\n"
-            "Install awkward (usually already with uproot) or tell me and I will write (edep_flat, edep_offsets) instead."
+    if missing:
+        raise KeyError(
+            "These sources are present in ROOT outputs but missing in manifest.csv mapping: "
+            + ", ".join(map(str, missing))
         )
-        return
 
-    # --- compute flux weights per entry (one per file) ---
-    dE_MeV = compute_dE_per_entry(out_source, out_energy)
 
-    flux_arr  = np.array(out_flux, dtype=np.float64)
-    nbeam_arr = np.array(out_nbeam, dtype=np.float64)
+    for s in tqdm(sources, desc="Sources"):
+        yh = np.zeros(len(bins) - 1)
+        syh = np.zeros(len(bins) - 1)
 
-    # this is the energy-bin integrated flux weight for that simulated point
-    w_flux_dE = flux_arr * dE_MeV
+        yh_tp = np.zeros(len(bins) - 1)
+        syh_tp = np.zeros(len(bins) - 1)
 
-    # per-hit event weight: each hit in that file gets the same weight
-    # (so that summing weights of hits reproduces flux*hitProb*dE)
-    w_perHit = np.zeros_like(w_flux_dE)
-    ok = np.isfinite(w_flux_dE) & (nbeam_arr > 0)
-    w_perHit[ok] = w_flux_dE[ok] / nbeam_arr[ok]
-    plot_edep_histograms_weighted(
-        sorted(per_source.keys()),
-        out_source,
-        out_edep_lists,
-        out_numhits,
-        w_perHit,
-        plots_dir,
+        yh_tp_sm = np.zeros(len(bins) - 1)
+        syh_tp_sm = np.zeros(len(bins) - 1)
+
+        yh_tp_sm_g = np.zeros(len(bins) - 1)
+        syh_tp_sm_g = np.zeros(len(bins) - 1)
+
+        yh_tp_sm_gin = np.zeros(len(bins) - 1)
+        syh_tp_sm_gin = np.zeros(len(bins) - 1)
+
+        for thisp in paths[s]:
+            with uproot.open(thisp) as thisfile:
+                # skip files without the expected tree
+                if "Events;1" not in thisfile.keys():
+                    continue
+
+                thistree = thisfile["Events"]
+                enes = thistree["edepGasTotal_keV"].array()  # awkward array
+                nshots = thisfile["RunInfo"]["nBeamOnRequested"].array()[0]
+                nhdep = np.array(thisfile["Events;1"]["nHitsEdep"].array())
+
+                # hit coordinates split per-event
+                hits_x = split_by_n(nhdep, thisfile["Hits;1"]["x_mm"].array())
+                hits_y = split_by_n(nhdep, thisfile["Hits;1"]["y_mm"].array())
+                hits_z = split_by_n(nhdep, thisfile["Hits;1"]["z_mm"].array())
+
+                GAGGHit = thistree["GAGGHit"].array() #np.zeros(len(hits_x))#thistree["GAGGHit"].array()
+
+                on_timepix = np.zeros(len(hits_x), dtype=int)
+                half = timepix_side_mm / 2.0
+
+                on_gagg = np.zeros(len(hits_x), dtype=int)
+
+                for ev in range(len(hits_x)):
+                    x = hits_x[ev]
+                    y = hits_y[ev]
+                    # z currently unused in selection, kept for parity with notebook
+                    _z = hits_z[ev]
+                    if np.any((x >= -half) & (x <= half) & (y >= -half) & (y <= half)):
+                        on_timepix[ev] = 1
+                    if GAGGHit[ev] != 0:
+                        on_gagg[ev] = 1
+                    
+
+            if int(nshots) <= 0:
+                continue
+
+            if len(on_timepix) != len(enes):
+                raise RuntimeError(
+                    f"Number of events with hits ({len(on_timepix)}) != number of energy depositions ({len(enes)}) "
+                    f"for file {thisp}"
+                )
+
+            # source spectrum integral (as in notebook)
+            if s not in spectra_tables:
+                raise KeyError(f"Source '{s}' not found in spectra table loaded from {spectra_directory}")
+
+            Egrid, Fgrid = spectra_tables[s]
+
+            edges = np.empty(Egrid.size + 1)
+            edges[1:-1] = np.sqrt(Egrid[:-1] * Egrid[1:])  # geometric midpoints (log grid)
+
+            r0 = Egrid[0] / Egrid[1]
+            rN = Egrid[-1] / Egrid[-2]
+            edges[0] = Egrid[0] * np.sqrt(r0)
+            edges[-1] = Egrid[-1] * np.sqrt(rN)
+
+            dE = edges[1:] - edges[:-1]
+            flux_int = np.sum(Fgrid * dE)
+
+            # histogram (all events)
+            y_tmp, _ = np.histogram(enes, bins=bins)
+            y_tmp = np.asarray(y_tmp)
+
+            # normalization (same as notebook)
+            #f = 4.0 * np.pi * (ar.SPHERE_RADIUS_MM / 10.0) ** 2 * np.pi
+            f = f_by_source[s]
+                        
+            pint = (y_tmp + 1) / (nshots + 2)
+            yh += pint * flux_int * f / bin_width_keV
+            syh += (pint * (1.0 - pint) / (nshots + 3)) * (flux_int * f / bin_width_keV) ** 2
+
+            # timepix-only
+            mask_tp = (on_timepix == 1)
+            y_tmp_tp, _ = np.histogram(enes[mask_tp], bins=bins)
+            y_tmp_tp = np.asarray(y_tmp_tp)
+            pint_tp = (y_tmp_tp + 1) / (nshots + 2)
+            yh_tp += pint_tp * flux_int * f / bin_width_keV
+            syh_tp += (pint_tp * (1.0 - pint_tp) / (nshots + 3)) * (flux_int * f / bin_width_keV) ** 2
+
+            # timepix + smearing
+            sm_enes = ak.to_numpy(enes)
+            sm_enes = st.norm.rvs(loc=sm_enes, scale=s_smearing * sm_enes)
+            
+            y_tmp_tp_sm, _ = np.histogram(sm_enes[mask_tp], bins=bins)
+            y_tmp_tp_sm = np.asarray(y_tmp_tp_sm)
+            pint_tp_sm = (y_tmp_tp_sm + 1) / (nshots + 2)
+            yh_tp_sm += pint_tp_sm * flux_int * f / bin_width_keV
+            syh_tp_sm += (pint_tp_sm * (1.0 - pint_tp_sm) / (nshots + 3)) * (flux_int * f / bin_width_keV) ** 2
+
+            # timepix + smearing + GAGG
+            mask_tp_g = (on_timepix == 1) & (on_gagg == 0)
+
+            y_tmp_tp_g, _ = np.histogram(sm_enes[mask_tp_g], bins=bins)
+            y_tmp_tp_g = np.asarray(y_tmp_tp_g)
+            pint_tp_g = (y_tmp_tp_g + 1) / (nshots + 2)
+            yh_tp_sm_g += pint_tp_g * flux_int * f / bin_width_keV
+            syh_tp_sm_g += (pint_tp_g * (1.0 - pint_tp_g) / (nshots + 3)) * (flux_int * f / bin_width_keV) ** 2
+
+            # --- NEW: timepix + smearing + GAGG in (GAGGHit != 0) ---
+            mask_tp_gin = (on_timepix == 1) & (on_gagg == 1)
+            y_tmp_tp_gin, _ = np.histogram(sm_enes[mask_tp_gin], bins=bins)
+            y_tmp_tp_gin = np.asarray(y_tmp_tp_gin)
+            pint_tp_gin = (y_tmp_tp_gin + 1) / (nshots + 2)
+            yh_tp_sm_gin += pint_tp_gin * flux_int * f / bin_width_keV
+            syh_tp_sm_gin += (pint_tp_gin * (1.0 - pint_tp_gin) / (nshots + 3)) * (flux_int * f / bin_width_keV) ** 2
+
+
+        yh_source[s] = yh
+        syh_source[s] = np.sqrt(syh)
+        yh_tot += yh
+        syh_tot += syh
+
+        yh_source_tp[s] = yh_tp
+        syh_source_tp[s] = np.sqrt(syh_tp)
+        yh_tot_tp += yh_tp
+        syh_tot_tp += syh_tp
+
+        yh_source_tp_sm[s] = yh_tp_sm
+        syh_source_tp_sm[s] = np.sqrt(syh_tp_sm)
+        yh_tot_tp_sm += yh_tp_sm
+        syh_tot_tp_sm += syh_tp_sm
+
+        yh_source_tp_sm_g[s] = yh_tp_sm_g
+        syh_source_tp_sm_g[s] = np.sqrt(syh_tp_sm_g)
+        yh_tot_tp_sm_g += yh_tp_sm_g
+        syh_tot_tp_sm_g += syh_tp_sm_g
+
+        yh_source_tp_sm_gin[s] = yh_tp_sm_gin
+        syh_source_tp_sm_gin[s] = np.sqrt(syh_tp_sm_gin)
+        yh_tot_tp_sm_gin += yh_tp_sm_gin
+        syh_tot_tp_sm_gin += syh_tp_sm_gin
+
+    # totals' sigma
+    syh_tot = np.sqrt(syh_tot)
+    syh_tot_tp = np.sqrt(syh_tot_tp)
+    syh_tot_tp_sm = np.sqrt(syh_tot_tp_sm)
+    syh_tot_tp_sm_g = np.sqrt(syh_tot_tp_sm_g)
+    syh_tot_tp_sm_gin = np.sqrt(syh_tot_tp_sm_gin)
+
+    return (
+        bins,
+        yh_tot, syh_tot, yh_source, syh_source,
+        yh_tot_tp, syh_tot_tp, yh_source_tp, syh_source_tp,
+        yh_tot_tp_sm, syh_tot_tp_sm, yh_source_tp_sm, syh_source_tp_sm,
+        yh_tot_tp_sm_g, syh_tot_tp_sm_g, yh_source_tp_sm_g, syh_source_tp_sm_g,
+        yh_tot_tp_sm_gin, syh_tot_tp_sm_gin, yh_source_tp_sm_gin, syh_source_tp_sm_gin,
+        sources,
     )
 
 
-    rows = {
-        "source": ak.Array(out_source),
-        "particle": ak.Array(out_particle),
-        "filename": ak.Array(out_filename),
-        "energy_MeV": np.array(out_energy, dtype=np.float64),
-        "nBeamOnRequested": np.array(out_nbeam, dtype=np.int64),
-        "numHits": np.array(out_numhits, dtype=np.int64),
-        "hitProb": np.array(out_hitprob, dtype=np.float64),
-        "err_hitProb": np.array(out_err_hitprob, dtype=np.float64),
-        "fluxSpace": np.array(out_flux, dtype=np.float64),
-        "dE_MeV": dE_MeV,
-        "w_flux_dE": w_flux_dE,
-        "w_perHit": w_perHit,
-        "rate_Hz": np.array(out_rate, dtype=np.float64),
-        "err_rate_Hz": np.array(out_err_rate, dtype=np.float64),
-        "edepGasTotal_keV": ak.Array(out_edep_lists),
-    }
+def plot_with_band(
+    outpath: Path,
+    title: str,
+    bins: np.ndarray,
+    y_tot: np.ndarray,
+    sy_tot: np.ndarray,
+    y_by_source: Dict[str, np.ndarray],
+    sy_by_source: Dict[str, np.ndarray],
+    sources,
+    bin_width_keV: float,
+    y_label: str = r"Flux density in detector [s$^{-1}$ keV$^{-1}$]",
+    y_min: float = 1e-2,
+):
+    integrated_flux = float(np.sum(y_tot * bin_width_keV))
+    sintegrated_flux = float(np.sqrt(np.sum((sy_tot**2) * (bin_width_keV**2))))
 
-    write_summary_root(outfile, rows)
-    log.info("Wrote %s with TTree 'FileSummary' (%d entries)", outfile, len(out_source))
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    ax.stairs(y_tot, bins, label="Total", linewidth=2)
+
+    # 1σ band (pad to draw the last bin with step='post')
+    y_low = np.maximum(y_tot - sy_tot, 1e-30)
+    y_high = np.maximum(y_tot + sy_tot, 1e-30)
+    y_low_p = np.r_[y_low, y_low[-1]]
+    y_high_p = np.r_[y_high, y_high[-1]]
+
+    ax.fill_between(bins, y_low_p, y_high_p, step="post", alpha=0.25, label=r"$\pm 1\sigma$")
+
+    for s in sources:
+        if s in y_by_source:
+            ax.stairs(y_by_source[s], bins, label=str(s), linewidth=1)
+            y_low = np.maximum(y_by_source[s] - sy_by_source[s], 1e-30)
+            y_high = np.maximum(y_by_source[s] + sy_by_source[s], 1e-30)
+            y_low_p = np.r_[y_low, y_low[-1]]
+            y_high_p = np.r_[y_high, y_high[-1]]
+
+            ax.fill_between(bins, y_low_p, y_high_p, step="post", alpha=0.25, label=None)
+
+    ax.set_title(title)
+    ax.set_yscale("log")
+    ax.set_ylabel(y_label)
+    ax.set_ylim(bottom=1e-4)
+    ax.legend(loc="lower right")
+
+    # place text at ~top-left; avoid clipping
+    ax.text(
+        0.02, 0.95,
+        f"Integrated flux = ({integrated_flux:.2f} ± {sintegrated_flux:.2f}) 1/S",
+        transform=ax.transAxes,
+        fontsize=12,
+        va="top",
+        ha="left",
+    )
+
+    fig.tight_layout()
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(outpath, dpi=200)
+    plt.close(fig)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Refactored Analysis_S notebook runner.")
+    p.add_argument("--directory", type=Path, help="Path containing run output ROOT files.", default=Path("run_outputs/"))
+    p.add_argument("--energy-min", type=float, required=False, help="Energy cut min (keV).", default=0.0)
+    p.add_argument("--energy-max", type=float, required=False, help="Energy cut max (keV).", default=100.0)
+    p.add_argument("--bin-width", type=float, required=False, help="Histogram bin width (keV).", default=1.0)
+    p.add_argument("--s-smearing", type=float, required=False, help="Gaussian relative smearing (e.g. 0.15 for 15 percent).", default=0.15)
+    # Not requested, but useful and keeps notebook behavior reproducible:
+    p.add_argument(
+        "--spectra-dir",
+        type=Path,
+        default=(THIS_DIR.parent / "gpd3d/spectra"),
+        help="Directory containing spectra tables (default: ../spectra relative to script).",
+    )
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    directory: Path = args.directory
+    if not directory.exists():
+        raise FileNotFoundError(f"Directory does not exist: {directory}")
+
+    bins, yh_tot, syh_tot, yh_source, syh_source, \
+        yh_tot_tp, syh_tot_tp, yh_source_tp, syh_source_tp, \
+        yh_tot_tp_sm, syh_tot_tp_sm, yh_source_tp_sm, syh_source_tp_sm, \
+        yh_tot_tp_sm_g, syh_tot_tp_sm_g, yh_source_tp_sm_g, syh_source_tp_sm_g, \
+        yh_tot_tp_sm_gin, syh_tot_tp_sm_gin, yh_source_tp_sm_gin, syh_source_tp_sm_gin, \
+        sources = compute_histograms(
+            directory=directory,
+            energy_min_keV=args.energy_min,
+            energy_max_keV=args.energy_max,
+            bin_width_keV=args.bin_width,
+            s_smearing=args.s_smearing,
+            spectra_directory=args.spectra_dir,
+        )
+
+    plot_dir: Path = args.directory / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    plot_with_band(
+        outpath=plot_dir / "flux_gas_volume_{0:.1f}_{1:.1f}_{2:.2f}.png".format(args.energy_min, args.energy_max, args.bin_width),
+        title="Simulated energy deposition in gas - entire gas volume",
+        bins=bins,
+        y_tot=yh_tot,
+        sy_tot=syh_tot,
+        y_by_source=yh_source,
+        sy_by_source=syh_source,
+        sources=sources,
+        bin_width_keV=args.bin_width,
+    )
+
+    plot_with_band(
+        outpath=plot_dir / "flux_timepix_{0:.1f}_{1:.1f}_{2:.2f}.png".format(args.energy_min, args.energy_max, args.bin_width),
+        title="Simulated energy deposition in gas - hits on Timepix",
+        bins=bins,
+        y_tot=yh_tot_tp,
+        sy_tot=syh_tot_tp,
+        y_by_source=yh_source_tp,
+        sy_by_source=syh_source_tp,
+        sources=sources,
+        bin_width_keV=args.bin_width,
+    )
+
+    plot_with_band(
+        outpath=plot_dir / "flux_timepix_smeared_{0:.1f}_{1:.1f}_{2:.2f}_{3:.2f}.png".format(args.energy_min,
+                                                                                             args.energy_max,
+                                                                                             args.bin_width,
+                                                                                             args.s_smearing
+                                                                                             ),
+        title=f"Simulated energy deposition in gas - Timepix smeared (σ={args.s_smearing:.3g})",
+        bins=bins,
+        y_tot=yh_tot_tp_sm,
+        sy_tot=syh_tot_tp_sm,
+        y_by_source=yh_source_tp_sm,
+        sy_by_source=syh_source_tp_sm,
+        sources=sources,
+        bin_width_keV=args.bin_width,
+    )
+
+    plot_with_band(
+        outpath=plot_dir / "flux_timepix_smeared_gagg_{0:.1f}_{1:.1f}_{2:.2f}_{3:.2f}.png".format(args.energy_min,
+                                                                                             args.energy_max,
+                                                                                             args.bin_width,
+                                                                                             args.s_smearing
+                                                                                             ),
+        title=f"Simulated energy deposition in gas - Timepix smeared + GAGG VETO (σ={args.s_smearing:.3g})",
+        bins=bins,
+        y_tot=yh_tot_tp_sm_g,
+        sy_tot=syh_tot_tp_sm_g,
+        y_by_source=yh_source_tp_sm_g,
+        sy_by_source=syh_source_tp_sm_g,
+        sources=sources,
+        bin_width_keV=args.bin_width,
+    )
+    
+    plot_with_band(
+        outpath=plot_dir / "flux_timepix_smeared_gaggIN_{0:.1f}_{1:.1f}_{2:.2f}_{3:.2f}.png".format(
+            args.energy_min, args.energy_max, args.bin_width, args.s_smearing
+        ),
+        title=f"Simulated energy deposition in gas - Timepix smeared + GAGG IN (σ={args.s_smearing:.3g})",
+        bins=bins,
+        y_tot=yh_tot_tp_sm_gin,
+        sy_tot=syh_tot_tp_sm_gin,
+        y_by_source=yh_source_tp_sm_gin,
+        sy_by_source=syh_source_tp_sm_gin,
+        sources=sources,
+        bin_width_keV=args.bin_width,
+    )
+
+    # --- integrated rates per source (3 cases) ---
+    rates_by_case: dict[str, dict[str, tuple[float, float]]] = {}
+
+    # standard
+    per_source_std = {s: compute_integrated_rate(yh_source[s], syh_source[s], args.bin_width) for s in sources}
+    per_source_std["Total"] = compute_integrated_rate(yh_tot, syh_tot, args.bin_width)
+    rates_by_case["standard"] = per_source_std
+
+    # timepix cut
+    per_source_tp = {s: compute_integrated_rate(yh_source_tp[s], syh_source_tp[s], args.bin_width) for s in sources}
+    per_source_tp["Total"] = compute_integrated_rate(yh_tot_tp, syh_tot_tp, args.bin_width)
+    rates_by_case["timepix_cut"] = per_source_tp
+
+    # timepix + diffusion (smearing)
+    per_source_tp_sm = {
+        s: compute_integrated_rate(yh_source_tp_sm[s], syh_source_tp_sm[s], args.bin_width) for s in sources
+    }
+    per_source_tp_sm["Total"] = compute_integrated_rate(yh_tot_tp_sm, syh_tot_tp_sm, args.bin_width)
+    rates_by_case["timepix_diffusion"] = per_source_tp_sm
+
+    # timepix + diffusion (smearing) + GAGG
+    per_source_tp_sm_g = {
+        s: compute_integrated_rate(yh_source_tp_sm_g[s], syh_source_tp_sm_g[s], args.bin_width) for s in sources
+    }
+    per_source_tp_sm_g["Total"] = compute_integrated_rate(yh_tot_tp_sm_g, syh_tot_tp_sm_g, args.bin_width)
+    rates_by_case["timepix_diffusion_gagg"] = per_source_tp_sm_g
+
+    rates_csv = plot_dir / "integrated_rates_{0:.1f}_{1:.1f}_{2:.2f}_{3:.2f}.csv".format(
+        args.energy_min, args.energy_max, args.bin_width, args.s_smearing
+    )
+
+    per_source_tp_sm_gin = {
+        s: compute_integrated_rate(yh_source_tp_sm_gin[s], syh_source_tp_sm_gin[s], args.bin_width) for s in sources
+    }
+    per_source_tp_sm_gin["Total"] = compute_integrated_rate(yh_tot_tp_sm_gin, syh_tot_tp_sm_gin, args.bin_width)
+    rates_by_case["timepix_diffusion_gaggIN"] = per_source_tp_sm_gin
+
+    save_integrated_rates_csv_per_source(
+        out_csv=rates_csv,
+        directory=directory,
+        energy_min_keV=args.energy_min,
+        energy_max_keV=args.energy_max,
+        bin_width_keV=args.bin_width,
+        s_smearing=args.s_smearing,
+        rates_by_case=rates_by_case,
+    )
+
+
+    print(f"Wrote plots to: {plot_dir}")
+    print(f"Wrote integrated rates to: {rates_csv}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
