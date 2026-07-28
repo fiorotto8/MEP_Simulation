@@ -46,6 +46,7 @@ RE_POS_THETA_MIN = re.compile(r"^\s*/gpd3d/gen/posThetaMin\s+.*$", re.MULTILINE)
 RE_POS_THETA_MAX = re.compile(r"^\s*/gpd3d/gen/posThetaMax\s+.*$", re.MULTILINE)
 
 RE_PRINT_PROGRESS = re.compile(r"^\s*/run/printProgress\s+\d+.*$", re.MULTILINE)
+RE_RANDOM_SEEDS = re.compile(r"^\s*/random/setSeeds\s+\d+\s+\d+.*$", re.MULTILINE)
 RE_STATUS_EVT = re.compile(r"-->\s*Event\s+(\d+)\s+starts\.", re.IGNORECASE)
 
 def sanitize_tag(s: str) -> str:
@@ -162,7 +163,7 @@ def infer_edges_from_centers(E):
             raise ValueError(f"Non-increasing inferred edges at i={i}")
     return edges
 
-def load_manifest(manifest_path: Path):
+def load_manifest(manifest_path: Path, spectra_dir: Path):
     items = []
     with open(manifest_path, newline="") as f:
         rdr = csv.DictReader(f)
@@ -173,7 +174,7 @@ def load_manifest(manifest_path: Path):
             tmin_deg = float(row["minTheta"])
             tmax_deg = float(row["maxTheta"])
             if fn:
-                items.append((SPECTRA_DIR / fn, particle, n_events, tmin_deg, tmax_deg))
+                items.append((spectra_dir / fn, particle, n_events, tmin_deg, tmax_deg))
     if not items:
         raise ValueError(f"No entries found in {manifest_path}")
     return items
@@ -182,7 +183,8 @@ def load_manifest(manifest_path: Path):
 # ---------- RUN ONE POINT ----------
 def run_one_point(exe: str, template_mac_text: str, spec_path: Path,
                   particle: str, spectrum_csv_for_g4: Path, sphere_radius_mm: float,
-                  n_events: int, root_out: Path, tmin_deg: float, tmax_deg: float):
+                  n_events: int, root_out: Path, tmin_deg: float, tmax_deg: float,
+                  random_seeds=None):
     mac_text = template_mac_text
 
     # enforce background ROOT output + file name
@@ -195,6 +197,14 @@ def run_one_point(exe: str, template_mac_text: str, spec_path: Path,
 
     pp = max(1, int(n_events // 100))          # ogni ~1% degli eventi
     mac_text = ensure_line(mac_text, RE_PRINT_PROGRESS, f"/run/printProgress {pp}")
+
+    if random_seeds is not None:
+        seed1, seed2 = random_seeds
+        mac_text = ensure_line(
+            mac_text,
+            RE_RANDOM_SEEDS,
+            f"/random/setSeeds {seed1} {seed2}",
+        )
 
     # inject GPS + spectrum block
     #mac_text = inject_gps_spectrum_block(mac_text, particle, spectrum_csv_for_g4)
@@ -338,6 +348,46 @@ def parse_args():
         default=Path("run_outputs"),
         help="Output directory for ROOT files and run summaries (default: run_outputs).",
     )
+    p.add_argument(
+        "--exe",
+        type=Path,
+        default=Path(EXE),
+        help=f"Geant4 executable (default: {EXE}).",
+    )
+    p.add_argument(
+        "--spectra-dir",
+        type=Path,
+        default=SPECTRA_DIR,
+        help=f"Directory containing spectrum CSV files (default: {SPECTRA_DIR}).",
+    )
+    p.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Manifest CSV. Defaults to <spectra-dir>/manifest.csv.",
+    )
+    p.add_argument(
+        "--template-mac",
+        type=Path,
+        default=TEMPLATE_MAC,
+        help=f"Geant4 macro template (default: {TEMPLATE_MAC}).",
+    )
+    p.add_argument(
+        "--max-workers",
+        type=int,
+        default=MAX_WORKERS,
+        help="Maximum parallel manifest workers for this run.",
+    )
+    p.add_argument(
+        "--base-seed",
+        type=int,
+        default=None,
+        help=(
+            "Optional deterministic base seed. Each manifest row gets a "
+            "different pair derived from it; reuse the base across geometry "
+            "configurations for matched random streams."
+        ),
+    )
     return p.parse_args()
 
 def make_overview_plots(points_rows):
@@ -347,7 +397,18 @@ def make_overview_plots(points_rows):
 
 # ---------- WORKER ----------
 def _worker_run_manifest_item(args):
-    (exe, template_mac_text, spec_path_str, particle, sphere_radius_mm, n_events, out_rootdir_str, tmin_deg, tmax_deg) = args
+    (
+        exe,
+        template_mac_text,
+        spec_path_str,
+        particle,
+        sphere_radius_mm,
+        n_events,
+        out_rootdir_str,
+        tmin_deg,
+        tmax_deg,
+        random_seeds,
+    ) = args
     spec_path = Path(spec_path_str)
     out_rootdir = Path(out_rootdir_str)
 
@@ -376,7 +437,8 @@ def _worker_run_manifest_item(args):
 
     phit, ngen, nhit, dt, root_file = run_one_point(
         exe, template_mac_text, spec_path, particle, spec_path.resolve(),
-        sphere_radius_mm, n_events, root_out, tmin_deg, tmax_deg
+        sphere_radius_mm, n_events, root_out, tmin_deg, tmax_deg,
+        random_seeds=random_seeds,
     )
 
     # Effective area and total rate from spectrum-weighted phit
@@ -413,6 +475,11 @@ def _worker_run_manifest_item(args):
 
 def main():
     args = parse_args()
+    if args.max_workers is None or args.max_workers < 1:
+        raise ValueError("--max-workers must be at least 1")
+    if args.base_seed is not None and args.base_seed < 1:
+        raise ValueError("--base-seed must be a positive integer")
+
     outdir = args.outdir
     outdir.mkdir(parents=True, exist_ok=True)
     out_rootdir = outdir / "root"
@@ -423,15 +490,20 @@ def main():
     out_png_rate = outdir / "rates_overview.png"
     out_png_phit = outdir / "phit_overview.png"
 
-    if not TEMPLATE_MAC.exists():
-        raise FileNotFoundError(f"Missing {TEMPLATE_MAC}")
-    if not MANIFEST.exists():
-        raise FileNotFoundError(f"Missing {MANIFEST}")
-    if not Path(EXE).exists():
-        raise FileNotFoundError(f"Missing executable {EXE}")
+    spectra_dir = args.spectra_dir
+    manifest = args.manifest or (spectra_dir / "manifest.csv")
+    template_mac = args.template_mac
+    exe = args.exe
 
-    manifest_items = load_manifest(MANIFEST)
-    template_mac_text = TEMPLATE_MAC.read_text()
+    if not template_mac.exists():
+        raise FileNotFoundError(f"Missing {template_mac}")
+    if not manifest.exists():
+        raise FileNotFoundError(f"Missing {manifest}")
+    if not exe.exists():
+        raise FileNotFoundError(f"Missing executable {exe}")
+
+    manifest_items = load_manifest(manifest, spectra_dir)
+    template_mac_text = template_mac.read_text()
 
     for spec_path, _, _, _, _ in manifest_items:
         if not spec_path.exists():
@@ -439,9 +511,17 @@ def main():
 
 
     worker_args = []
-    for spec_path, particle, n_events, tmin_deg, tmax_deg in manifest_items:
+    for item_index, (spec_path, particle, n_events, tmin_deg, tmax_deg) in enumerate(manifest_items):
+        random_seeds = None
+        if args.base_seed is not None:
+            # Ranecu accepts positive long seeds. Keep values in a conservative
+            # range and use a stable pair per manifest row.
+            seed1 = ((args.base_seed + 2 * item_index) % 900000000) + 1
+            seed2 = ((args.base_seed + 2 * item_index + 1) % 900000000) + 1
+            random_seeds = (seed1, seed2)
+
         worker_args.append((
-            EXE,
+            str(exe),
             template_mac_text,
             str(spec_path),
             particle,
@@ -449,19 +529,32 @@ def main():
             n_events,
             str(out_rootdir),
             tmin_deg,
-            tmax_deg
+            tmax_deg,
+            random_seeds,
         ))
 
+    run_configuration = {
+        "executable": str(exe.resolve()),
+        "manifest": str(manifest.resolve()),
+        "spectra_directory": str(spectra_dir.resolve()),
+        "template_macro": str(template_mac.resolve()),
+        "max_workers": args.max_workers,
+        "base_seed": args.base_seed,
+        "tungsten_plug": os.environ.get("GPD3D_ENABLE_W_PLUG", "default"),
+        "tungsten_tube": os.environ.get("GPD3D_ENABLE_W_TUBE", "default"),
+    }
+    with open(outdir / "run_configuration.json", "w") as f:
+        json.dump(run_configuration, f, indent=2)
 
     results = []
     all_points = []
     total_rate = 0.0
 
     print(f"Running {len(worker_args)} manifest entries in parallel "
-          f"(max_workers={MAX_WORKERS or os.cpu_count()})")
+          f"(max_workers={args.max_workers})")
     print(f"ROOT outputs under: {out_rootdir}")
 
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as pool:
+    with ProcessPoolExecutor(max_workers=args.max_workers) as pool:
         fut_map = {pool.submit(_worker_run_manifest_item, a): a for a in worker_args}
         for fut in as_completed(fut_map):
             a = fut_map[fut]

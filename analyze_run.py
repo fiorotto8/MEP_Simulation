@@ -9,7 +9,6 @@ Computes flux-density histograms from Geant4 ROOT outputs and produces plots:
 
 Requires:
 - numpy, awkward, uproot, matplotlib, scipy, tqdm
-- your local `analyze_run.py` (imported as ar)
 """
 
 from __future__ import annotations
@@ -17,8 +16,11 @@ from __future__ import annotations
 import argparse
 import sys
 import csv
+import os
+import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List, Optional
 
 import numpy as np
 import awkward as ak
@@ -27,10 +29,83 @@ import matplotlib.pyplot as plt
 import scipy.stats as st
 from tqdm import tqdm
 
-# Make sure analyze_run.py is importable (same policy as the notebook: sys.path.append("../"))
+
 THIS_DIR = Path(__file__).resolve().parent
-sys.path.append(str(THIS_DIR.parent))
-import analyze_run as ar  # noqa: E402
+
+ENERGY_RE = re.compile(r"E([\d.]+)MeV")
+
+
+@dataclass(frozen=True)
+class FileMeta:
+    source: str
+    particle: str
+    energy_MeV: float
+    filename: str
+    path: Path
+
+
+def parse_root_filename(filename: str) -> Optional[Tuple[str, str, float]]:
+    """
+    Expected pattern: <source>_<particle>_..._E<energy>MeV.root
+    Returns (source, particle, energy_MeV) or None if it can't parse.
+    """
+    if not filename.endswith(".root"):
+        return None
+    stem = filename[:-5]
+    parts = stem.split("_")
+    if len(parts) < 2:
+        return None
+
+    source = parts[0]
+    particle = parts[1]
+
+    m = ENERGY_RE.search(stem)
+    energy = float(m.group(1)) if m else float("nan")
+    return source, particle, energy
+
+
+def find_root_files(base_dir: Path) -> List[FileMeta]:
+    out: List[FileMeta] = []
+    for root, _, files in os.walk(base_dir):
+        rootp = Path(root)
+        for fn in files:
+            if not fn.endswith(".root"):
+                continue
+            parsed = parse_root_filename(fn)
+            if not parsed:
+                continue
+            source, particle, energy = parsed
+            out.append(FileMeta(source, particle, energy, fn, rootp / fn))
+
+    out.sort(key=lambda x: (x.source, x.particle, x.energy_MeV, x.filename))
+    return out
+
+
+def load_spectra_table(spectra_dir: Path) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    """
+    Returns dict: source_name -> (E_sorted, F_sorted)
+    CSV format: E, fluxSpace  (comma-separated)
+    Key is filename without extension.
+    """
+    tables: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for fn in spectra_dir.iterdir():
+        if fn.suffix.lower() != ".csv":
+            continue
+        if fn.name == "manifest.csv":
+            continue
+
+        arr = np.loadtxt(fn, delimiter=",")
+        if arr.ndim == 1 and arr.size == 2:
+            arr = arr.reshape(1, 2)
+
+        E = arr[:, 0].astype(float)
+        F = arr[:, 1].astype(float)
+
+        idx = np.argsort(E)
+        tables[fn.stem] = (E[idx], F[idx])
+
+    return tables
+
 
 def load_theta_limits_from_manifest(manifest_csv: Path) -> dict[str, tuple[float, float]]:
     out = {}
@@ -40,9 +115,10 @@ def load_theta_limits_from_manifest(manifest_csv: Path) -> dict[str, tuple[float
             fn = row["filename"].strip()
             tmin = float(row["minTheta"])
             tmax = float(row["maxTheta"])
-            out[fn] = (tmin, tmax)               # full name
-            out[Path(fn).stem] = (tmin, tmax)    # stem
+            out[fn] = (tmin, tmax)
+            out[Path(fn).stem] = (tmin, tmax)
     return out
+
 
 def compute_f_from_theta(R_mm: float, tmin_deg: float, tmax_deg: float) -> float:
     R_cm = R_mm / 10.0
@@ -54,6 +130,7 @@ def compute_f_from_theta(R_mm: float, tmin_deg: float, tmax_deg: float) -> float
         tmin, tmax = 0.0, np.pi
     A_patch = 2.0 * np.pi * (R_cm**2) * (np.cos(tmin) - np.cos(tmax))
     return np.pi * A_patch
+
 
 def compute_integrated_rate(y: np.ndarray, sy: np.ndarray, bin_width_keV: float) -> tuple[float, float]:
     """
@@ -68,6 +145,7 @@ def compute_integrated_rate(y: np.ndarray, sy: np.ndarray, bin_width_keV: float)
     rate = float(np.sum(y * bw))
     srate = float(np.sqrt(np.sum((sy * bw) ** 2)))
     return rate, srate
+
 
 def save_integrated_rates_csv_per_source(
     out_csv: Path,
@@ -104,7 +182,6 @@ def save_integrated_rates_csv_per_source(
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for case, per_source in rates_by_case.items():
-            # stable ordering: Total first if present, then alphabetical
             sources = list(per_source.keys())
             ordered = []
             if "Total" in per_source:
@@ -174,9 +251,9 @@ def compute_histograms(
       timepix + smear + IN:  (yh_tot_tp_sm_gin, syh_tot_tp_sm_gin, yh_source_tp_sm_gin, syh_source_tp_sm_gin),
       sources
     """
-    spectra_tables = ar.load_spectra_table(spectra_directory)
+    spectra_tables = load_spectra_table(spectra_directory)
 
-    files = ar.find_root_files(directory)
+    files = find_root_files(directory)
     if len(files) == 0:
         raise FileNotFoundError(f"No ROOT files found under: {directory}")
 
@@ -191,45 +268,37 @@ def compute_histograms(
 
     timepix_side_mm = 14.08
 
-    # totals
     yh_tot = np.zeros(len(bins) - 1)
     syh_tot = np.zeros(len(bins) - 1)
     yh_source: Dict[str, np.ndarray] = {}
     syh_source: Dict[str, np.ndarray] = {}
 
-    # timepix-only
     yh_tot_tp = np.zeros(len(bins) - 1)
     syh_tot_tp = np.zeros(len(bins) - 1)
     yh_source_tp: Dict[str, np.ndarray] = {}
     syh_source_tp: Dict[str, np.ndarray] = {}
 
-    # timepix + smearing
     yh_tot_tp_sm = np.zeros(len(bins) - 1)
     syh_tot_tp_sm = np.zeros(len(bins) - 1)
     yh_source_tp_sm: Dict[str, np.ndarray] = {}
     syh_source_tp_sm: Dict[str, np.ndarray] = {}
 
-    # timepix + smearing + GAGG
     yh_tot_tp_sm_g = np.zeros(len(bins) - 1)
     syh_tot_tp_sm_g = np.zeros(len(bins) - 1)
     yh_source_tp_sm_g: Dict[str, np.ndarray] = {}
     syh_source_tp_sm_g: Dict[str, np.ndarray] = {}
-    
-    # --- NEW: timepix + smearing + GAGG in (on_gagg == 1) ---
+
     yh_tot_tp_sm_gin = np.zeros(len(bins) - 1)
     syh_tot_tp_sm_gin = np.zeros(len(bins) - 1)
     yh_source_tp_sm_gin: Dict[str, np.ndarray] = {}
     syh_source_tp_sm_gin: Dict[str, np.ndarray] = {}
 
-    # --- NEW: normalization from manifest (theta-limited sphere patch) ---
     manifest_csv = spectra_directory / "manifest.csv"
     if not manifest_csv.exists():
         raise FileNotFoundError(f"Missing manifest.csv in spectra_dir: {manifest_csv}")
 
     theta_map = load_theta_limits_from_manifest(manifest_csv)
 
-    # sphere radius in mm: keep consistent with your generator
-    # ideally pass as argument; for now use the same constant as in generation
     sphere_radius_mm = 130.0
 
     f_by_source: Dict[str, float] = {}
@@ -246,7 +315,6 @@ def compute_histograms(
             "These sources are present in ROOT outputs but missing in manifest.csv mapping: "
             + ", ".join(map(str, missing))
         )
-
 
     for s in tqdm(sources, desc="Sources"):
         yh = np.zeros(len(bins) - 1)
@@ -266,21 +334,19 @@ def compute_histograms(
 
         for thisp in paths[s]:
             with uproot.open(thisp) as thisfile:
-                # skip files without the expected tree
                 if "Events;1" not in thisfile.keys():
                     continue
 
                 thistree = thisfile["Events"]
-                enes = thistree["edepGasTotal_keV"].array()  # awkward array
+                enes = thistree["edepGasTotal_keV"].array()
                 nshots = thisfile["RunInfo"]["nBeamOnRequested"].array()[0]
                 nhdep = np.array(thisfile["Events;1"]["nHitsEdep"].array())
 
-                # hit coordinates split per-event
-                hits_x = split_by_n(nhdep, thisfile["Hits;1"]["x_mm"].array())
-                hits_y = split_by_n(nhdep, thisfile["Hits;1"]["y_mm"].array())
-                hits_z = split_by_n(nhdep, thisfile["Hits;1"]["z_mm"].array())
+                hits_x = split_by_n(nhdep, thisfile["Hits"]["x_mm"].array())
+                hits_y = split_by_n(nhdep, thisfile["Hits"]["y_mm"].array())
+                hits_z = split_by_n(nhdep, thisfile["Hits"]["z_mm"].array())
 
-                GAGGHit = thistree["GAGGHit"].array() #np.zeros(len(hits_x))#thistree["GAGGHit"].array()
+                GAGGHit = thistree["GAGGHit"].array()
 
                 on_timepix = np.zeros(len(hits_x), dtype=int)
                 half = timepix_side_mm / 2.0
@@ -290,13 +356,11 @@ def compute_histograms(
                 for ev in range(len(hits_x)):
                     x = hits_x[ev]
                     y = hits_y[ev]
-                    # z currently unused in selection, kept for parity with notebook
                     _z = hits_z[ev]
                     if np.any((x >= -half) & (x <= half) & (y >= -half) & (y <= half)):
                         on_timepix[ev] = 1
                     if GAGGHit[ev] != 0:
                         on_gagg[ev] = 1
-                    
 
             if int(nshots) <= 0:
                 continue
@@ -307,14 +371,13 @@ def compute_histograms(
                     f"for file {thisp}"
                 )
 
-            # source spectrum integral (as in notebook)
             if s not in spectra_tables:
                 raise KeyError(f"Source '{s}' not found in spectra table loaded from {spectra_directory}")
 
             Egrid, Fgrid = spectra_tables[s]
 
             edges = np.empty(Egrid.size + 1)
-            edges[1:-1] = np.sqrt(Egrid[:-1] * Egrid[1:])  # geometric midpoints (log grid)
+            edges[1:-1] = np.sqrt(Egrid[:-1] * Egrid[1:])
 
             r0 = Egrid[0] / Egrid[1]
             rN = Egrid[-1] / Egrid[-2]
@@ -324,19 +387,15 @@ def compute_histograms(
             dE = edges[1:] - edges[:-1]
             flux_int = np.sum(Fgrid * dE)
 
-            # histogram (all events)
             y_tmp, _ = np.histogram(enes, bins=bins)
             y_tmp = np.asarray(y_tmp)
 
-            # normalization (same as notebook)
-            #f = 4.0 * np.pi * (ar.SPHERE_RADIUS_MM / 10.0) ** 2 * np.pi
             f = f_by_source[s]
-                        
+
             pint = (y_tmp + 1) / (nshots + 2)
             yh += pint * flux_int * f / bin_width_keV
             syh += (pint * (1.0 - pint) / (nshots + 3)) * (flux_int * f / bin_width_keV) ** 2
 
-            # timepix-only
             mask_tp = (on_timepix == 1)
             y_tmp_tp, _ = np.histogram(enes[mask_tp], bins=bins)
             y_tmp_tp = np.asarray(y_tmp_tp)
@@ -344,17 +403,15 @@ def compute_histograms(
             yh_tp += pint_tp * flux_int * f / bin_width_keV
             syh_tp += (pint_tp * (1.0 - pint_tp) / (nshots + 3)) * (flux_int * f / bin_width_keV) ** 2
 
-            # timepix + smearing
             sm_enes = ak.to_numpy(enes)
             sm_enes = st.norm.rvs(loc=sm_enes, scale=s_smearing * sm_enes)
-            
+
             y_tmp_tp_sm, _ = np.histogram(sm_enes[mask_tp], bins=bins)
             y_tmp_tp_sm = np.asarray(y_tmp_tp_sm)
             pint_tp_sm = (y_tmp_tp_sm + 1) / (nshots + 2)
             yh_tp_sm += pint_tp_sm * flux_int * f / bin_width_keV
             syh_tp_sm += (pint_tp_sm * (1.0 - pint_tp_sm) / (nshots + 3)) * (flux_int * f / bin_width_keV) ** 2
 
-            # timepix + smearing + GAGG
             mask_tp_g = (on_timepix == 1) & (on_gagg == 0)
 
             y_tmp_tp_g, _ = np.histogram(sm_enes[mask_tp_g], bins=bins)
@@ -363,14 +420,12 @@ def compute_histograms(
             yh_tp_sm_g += pint_tp_g * flux_int * f / bin_width_keV
             syh_tp_sm_g += (pint_tp_g * (1.0 - pint_tp_g) / (nshots + 3)) * (flux_int * f / bin_width_keV) ** 2
 
-            # --- NEW: timepix + smearing + GAGG in (GAGGHit != 0) ---
             mask_tp_gin = (on_timepix == 1) & (on_gagg == 1)
             y_tmp_tp_gin, _ = np.histogram(sm_enes[mask_tp_gin], bins=bins)
             y_tmp_tp_gin = np.asarray(y_tmp_tp_gin)
             pint_tp_gin = (y_tmp_tp_gin + 1) / (nshots + 2)
             yh_tp_sm_gin += pint_tp_gin * flux_int * f / bin_width_keV
             syh_tp_sm_gin += (pint_tp_gin * (1.0 - pint_tp_gin) / (nshots + 3)) * (flux_int * f / bin_width_keV) ** 2
-
 
         yh_source[s] = yh
         syh_source[s] = np.sqrt(syh)
@@ -397,7 +452,6 @@ def compute_histograms(
         yh_tot_tp_sm_gin += yh_tp_sm_gin
         syh_tot_tp_sm_gin += syh_tp_sm_gin
 
-    # totals' sigma
     syh_tot = np.sqrt(syh_tot)
     syh_tot_tp = np.sqrt(syh_tot_tp)
     syh_tot_tp_sm = np.sqrt(syh_tot_tp_sm)
@@ -435,7 +489,6 @@ def plot_with_band(
 
     ax.stairs(y_tot, bins, label="Total", linewidth=2)
 
-    # 1σ band (pad to draw the last bin with step='post')
     y_low = np.maximum(y_tot - sy_tot, 1e-30)
     y_high = np.maximum(y_tot + sy_tot, 1e-30)
     y_low_p = np.r_[y_low, y_low[-1]]
@@ -459,7 +512,6 @@ def plot_with_band(
     ax.set_ylim(bottom=1e-4)
     ax.legend(loc="lower right")
 
-    # place text at ~top-left; avoid clipping
     ax.text(
         0.02, 0.95,
         f"Integrated flux = ({integrated_flux:.2f} ± {sintegrated_flux:.2f}) 1/S",
@@ -482,12 +534,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--energy-max", type=float, required=False, help="Energy cut max (keV).", default=100.0)
     p.add_argument("--bin-width", type=float, required=False, help="Histogram bin width (keV).", default=1.0)
     p.add_argument("--s-smearing", type=float, required=False, help="Gaussian relative smearing (e.g. 0.15 for 15 percent).", default=0.15)
-    # Not requested, but useful and keeps notebook behavior reproducible:
     p.add_argument(
         "--spectra-dir",
         type=Path,
         default=(THIS_DIR.parent / "gpd3d/spectra"),
-        help="Directory containing spectra tables (default: ../spectra relative to script).",
+        help="Directory containing spectra tables.",
     )
     return p.parse_args()
 
@@ -541,11 +592,9 @@ def main() -> int:
     )
 
     plot_with_band(
-        outpath=plot_dir / "flux_timepix_smeared_{0:.1f}_{1:.1f}_{2:.2f}_{3:.2f}.png".format(args.energy_min,
-                                                                                             args.energy_max,
-                                                                                             args.bin_width,
-                                                                                             args.s_smearing
-                                                                                             ),
+        outpath=plot_dir / "flux_timepix_smeared_{0:.1f}_{1:.1f}_{2:.2f}_{3:.2f}.png".format(
+            args.energy_min, args.energy_max, args.bin_width, args.s_smearing
+        ),
         title=f"Simulated energy deposition in gas - Timepix smeared (σ={args.s_smearing:.3g})",
         bins=bins,
         y_tot=yh_tot_tp_sm,
@@ -557,11 +606,9 @@ def main() -> int:
     )
 
     plot_with_band(
-        outpath=plot_dir / "flux_timepix_smeared_gagg_{0:.1f}_{1:.1f}_{2:.2f}_{3:.2f}.png".format(args.energy_min,
-                                                                                             args.energy_max,
-                                                                                             args.bin_width,
-                                                                                             args.s_smearing
-                                                                                             ),
+        outpath=plot_dir / "flux_timepix_smeared_gagg_{0:.1f}_{1:.1f}_{2:.2f}_{3:.2f}.png".format(
+            args.energy_min, args.energy_max, args.bin_width, args.s_smearing
+        ),
         title=f"Simulated energy deposition in gas - Timepix smeared + GAGG VETO (σ={args.s_smearing:.3g})",
         bins=bins,
         y_tot=yh_tot_tp_sm_g,
@@ -571,7 +618,7 @@ def main() -> int:
         sources=sources,
         bin_width_keV=args.bin_width,
     )
-    
+
     plot_with_band(
         outpath=plot_dir / "flux_timepix_smeared_gaggIN_{0:.1f}_{1:.1f}_{2:.2f}_{3:.2f}.png".format(
             args.energy_min, args.energy_max, args.bin_width, args.s_smearing
@@ -586,42 +633,37 @@ def main() -> int:
         bin_width_keV=args.bin_width,
     )
 
-    # --- integrated rates per source (3 cases) ---
     rates_by_case: dict[str, dict[str, tuple[float, float]]] = {}
 
-    # standard
     per_source_std = {s: compute_integrated_rate(yh_source[s], syh_source[s], args.bin_width) for s in sources}
     per_source_std["Total"] = compute_integrated_rate(yh_tot, syh_tot, args.bin_width)
     rates_by_case["standard"] = per_source_std
 
-    # timepix cut
     per_source_tp = {s: compute_integrated_rate(yh_source_tp[s], syh_source_tp[s], args.bin_width) for s in sources}
     per_source_tp["Total"] = compute_integrated_rate(yh_tot_tp, syh_tot_tp, args.bin_width)
     rates_by_case["timepix_cut"] = per_source_tp
 
-    # timepix + diffusion (smearing)
     per_source_tp_sm = {
         s: compute_integrated_rate(yh_source_tp_sm[s], syh_source_tp_sm[s], args.bin_width) for s in sources
     }
     per_source_tp_sm["Total"] = compute_integrated_rate(yh_tot_tp_sm, syh_tot_tp_sm, args.bin_width)
     rates_by_case["timepix_diffusion"] = per_source_tp_sm
 
-    # timepix + diffusion (smearing) + GAGG
     per_source_tp_sm_g = {
         s: compute_integrated_rate(yh_source_tp_sm_g[s], syh_source_tp_sm_g[s], args.bin_width) for s in sources
     }
     per_source_tp_sm_g["Total"] = compute_integrated_rate(yh_tot_tp_sm_g, syh_tot_tp_sm_g, args.bin_width)
     rates_by_case["timepix_diffusion_gagg"] = per_source_tp_sm_g
 
-    rates_csv = plot_dir / "integrated_rates_{0:.1f}_{1:.1f}_{2:.2f}_{3:.2f}.csv".format(
-        args.energy_min, args.energy_max, args.bin_width, args.s_smearing
-    )
-
     per_source_tp_sm_gin = {
         s: compute_integrated_rate(yh_source_tp_sm_gin[s], syh_source_tp_sm_gin[s], args.bin_width) for s in sources
     }
     per_source_tp_sm_gin["Total"] = compute_integrated_rate(yh_tot_tp_sm_gin, syh_tot_tp_sm_gin, args.bin_width)
     rates_by_case["timepix_diffusion_gaggIN"] = per_source_tp_sm_gin
+
+    rates_csv = plot_dir / "integrated_rates_{0:.1f}_{1:.1f}_{2:.2f}_{3:.2f}.csv".format(
+        args.energy_min, args.energy_max, args.bin_width, args.s_smearing
+    )
 
     save_integrated_rates_csv_per_source(
         out_csv=rates_csv,
@@ -632,7 +674,6 @@ def main() -> int:
         s_smearing=args.s_smearing,
         rates_by_case=rates_by_case,
     )
-
 
     print(f"Wrote plots to: {plot_dir}")
     print(f"Wrote integrated rates to: {rates_csv}")

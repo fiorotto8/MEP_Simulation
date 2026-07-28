@@ -45,6 +45,10 @@
 
 #include <sstream>
 #include <math.h>
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <string>
 
 using namespace std;
 
@@ -59,6 +63,34 @@ using namespace std;
 #include "G4SystemOfUnits.hh"
 
 #include "G4UserLimits.hh"
+
+namespace {
+
+bool ReadBooleanEnvironmentVariable(const char* name, bool defaultValue)
+{
+  const char* rawValue = std::getenv(name);
+  if (rawValue == nullptr || *rawValue == '\0') {
+    return defaultValue;
+  }
+
+  std::string value(rawValue);
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+  if (value == "1" || value == "true" || value == "yes" || value == "on") {
+    return true;
+  }
+  if (value == "0" || value == "false" || value == "no" || value == "off") {
+    return false;
+  }
+
+  G4cerr << "Unrecognized value '" << rawValue << "' for " << name
+         << "; using default " << (defaultValue ? "enabled" : "disabled")
+         << G4endl;
+  return defaultValue;
+}
+
+}  // namespace
 
 GPD3D_DetectorConstruction::GPD3D_DetectorConstruction()
 : G4VUserDetectorConstruction()
@@ -494,52 +526,75 @@ G4VPhysicalVolume* GPD3D_DetectorConstruction::Construct()
   // ---------- AL BOX LOGICAL VOLUME ----------
   auto lvAlBox = new G4LogicalVolume(sAlShellWithHole, Al, "AlBoxShell_LV");
 
-  // ---------- TUNGSTEN PLUG FOR +Z HOLE ----------
-  auto sWPlug = new G4Tubs("WPlug_S",
-                          0., alHoleRadius,
-                          wPlugThick/2.,
-                          0.*deg, 360.*deg);
-  auto lvWPlug = new G4LogicalVolume(sWPlug, W, "WPlug_LV");
-  auto visWPlug = new G4VisAttributes(G4Colour(0.2,0.2,0.2,0.9));
-  visWPlug->SetForceSolid(true);
-  lvWPlug->SetVisAttributes(visWPlug);
+  const bool enableWPlug =
+      ReadBooleanEnvironmentVariable("GPD3D_ENABLE_W_PLUG", true);
+  const bool requestedWTube =
+      ReadBooleanEnvironmentVariable("GPD3D_ENABLE_W_TUBE", true);
+  const bool enableWTube = enableWPlug && requestedWTube;
+
+  if (requestedWTube && !enableWPlug) {
+    G4cerr << "GPD3D_ENABLE_W_TUBE was enabled while GPD3D_ENABLE_W_PLUG "
+           << "was disabled; disabling the tube because it must extend from "
+           << "the plug." << G4endl;
+  }
+
+  G4cout << "Tungsten +Z geometry: plug="
+         << (enableWPlug ? "enabled" : "disabled")
+         << ", tube=" << (enableWTube ? "enabled" : "disabled")
+         << G4endl;
+
   const G4double zWPlug = detZc + zHoleLocal;
-  new G4PVPlacement(nullptr,
-                  G4ThreeVector(0,0,zWPlug),
-                  lvWPlug,
-                  "WPlug_PV",
-                  worldLV,
-                  false, 301,
-                  overlapCheck);
 
-    // Tungsten tube extending from the plug toward +Z
-  const G4double wTubeInnerR = alHoleRadius;
-  const G4double wTubeThick  = 0.2*mm;
-  const G4double wTubeOuterR = wTubeInnerR + wTubeThick;
-  const G4double wTubeLength = 10.0*cm;
+  // ---------- TUNGSTEN PLUG FOR +Z HOLE ----------
+  if (enableWPlug) {
+    auto sWPlug = new G4Tubs("WPlug_S",
+                            0., alHoleRadius,
+                            wPlugThick/2.,
+                            0.*deg, 360.*deg);
+    auto lvWPlug = new G4LogicalVolume(sWPlug, W, "WPlug_LV");
+    auto visWPlug = new G4VisAttributes(G4Colour(0.2,0.2,0.2,0.9));
+    visWPlug->SetForceSolid(true);
+    lvWPlug->SetVisAttributes(visWPlug);
+    new G4PVPlacement(nullptr,
+                      G4ThreeVector(0,0,zWPlug),
+                      lvWPlug,
+                      "WPlug_PV",
+                      worldLV,
+                      false, 301,
+                      overlapCheck);
+  }
 
-  auto sWTube = new G4Tubs("WTube_S",
-                           wTubeInnerR,
-                           wTubeOuterR,
-                           wTubeLength/2.,
-                           0.*deg, 360.*deg);
+  // ---------- TUNGSTEN TUBE EXTENDING FROM THE PLUG TOWARD +Z ----------
+  if (enableWTube) {
+    const G4double wTubeInnerR = alHoleRadius;
+    const G4double wTubeThick  = 0.2*mm;
+    const G4double wTubeOuterR = wTubeInnerR + wTubeThick;
+    const G4double wTubeLength = 10.0*cm;
 
-  auto lvWTube = new G4LogicalVolume(sWTube, W, "WTube_LV");
+    auto sWTube = new G4Tubs("WTube_S",
+                             wTubeInnerR,
+                             wTubeOuterR,
+                             wTubeLength/2.,
+                             0.*deg, 360.*deg);
 
-  auto visWTube = new G4VisAttributes(G4Colour(0.15,0.15,0.15,0.9));
-  visWTube->SetForceSolid(true);
-  lvWTube->SetVisAttributes(visWTube);
+    auto lvWTube = new G4LogicalVolume(sWTube, W, "WTube_LV");
 
-  // Tube starts at the outer face of the plug and extends toward +Z
-  const G4double zWTube = zWPlug + wPlugThick/2. + wTubeLength/2.;
+    auto visWTube = new G4VisAttributes(G4Colour(0.15,0.15,0.15,0.9));
+    visWTube->SetForceSolid(true);
+    lvWTube->SetVisAttributes(visWTube);
 
-  new G4PVPlacement(nullptr,
-                    G4ThreeVector(0,0,zWTube),
-                    lvWTube,
-                    "WTube_PV",
-                    worldLV,
-                    false, 302,
-                    overlapCheck);
+    // Tube starts at the outer face of the plug and extends toward +Z.
+    const G4double zWTube =
+        zWPlug + wPlugThick/2. + wTubeLength/2.;
+
+    new G4PVPlacement(nullptr,
+                      G4ThreeVector(0,0,zWTube),
+                      lvWTube,
+                      "WTube_PV",
+                      worldLV,
+                      false, 302,
+                      overlapCheck);
+  }
 
 
   // visualization

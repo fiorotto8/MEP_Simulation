@@ -9,3 +9,5 @@ build/*
 debug/*
 plots/*
 __pycache__/*   
+build*/
+run_outputs*/
